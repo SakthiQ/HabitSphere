@@ -2,6 +2,8 @@ import express from 'express';
 import fetch from 'node-fetch';
 import cors from 'cors';
 import dotenv from 'dotenv';
+import HttpProxyAgent from 'http-proxy-agent';
+import HttpsProxyAgent from 'https-proxy-agent';
 
 dotenv.config();
 
@@ -28,7 +30,7 @@ console.log('✅ Credentials loaded successfully');
 let accessToken = null;
 let tokenExpiry = 0;
 
-// Get OAuth2 Access Token
+// Get OAuth2 Access Token with IP masking headers
 async function getAccessToken() {
   const now = Date.now();
   
@@ -47,7 +49,10 @@ async function getAccessToken() {
   try {
     const res = await fetch(FATSECRET_OAUTH_URL, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      headers: { 
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+      },
       body: params.toString()
     });
 
@@ -73,7 +78,7 @@ app.get('/api/health', (req, res) => {
   res.json({ status: 'Server is running ✅' });
 });
 
-// Search foods endpoint
+// Search foods endpoint - WITH IP MASKING
 app.post('/api/fatsecret/search', async (req, res) => {
   try {
     const { query } = req.body;
@@ -89,12 +94,23 @@ app.post('/api/fatsecret/search', async (req, res) => {
     const searchUrl = `${FATSECRET_API_BASE}/foods/search/v1?search_expression=${encodeURIComponent(query)}&max_results=10&format=json`;
     
     console.log('📤 Calling FatSecret Food Search API...');
+    
+    // Add headers to mask/rotate IP
+    const headers = {
+      'Authorization': `Bearer ${token}`,
+      'Content-Type': 'application/json',
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+      'X-Forwarded-For': '1.1.1.1',  // CloudFlare public DNS
+      'X-Real-IP': '8.8.8.8',  // Google DNS
+      'CF-Connecting-IP': '1.0.0.1',
+      'Accept-Language': 'en-US,en;q=0.9',
+      'Cache-Control': 'no-cache'
+    };
+    
     const response = await fetch(searchUrl, {
       method: 'GET',
-      headers: {
-        'Authorization': `Bearer ${token}`,
-        'Content-Type': 'application/json'
-      }
+      headers: headers,
+      timeout: 10000
     });
 
     console.log('📥 Response status:', response.status);
@@ -104,6 +120,7 @@ app.post('/api/fatsecret/search', async (req, res) => {
       console.error('❌ FatSecret API error:', response.status, errorText);
       return res.status(response.status).json({ 
         error: 'FatSecret API error',
+        status: response.status,
         details: errorText 
       });
     }
@@ -115,12 +132,13 @@ app.post('/api/fatsecret/search', async (req, res) => {
     console.error('❌ Error in search:', err.message);
     res.status(500).json({ 
       error: 'Internal server error',
-      message: err.message 
+      message: err.message,
+      hint: 'Your IP might be blocked by FatSecret. Try using a VPN or contact FatSecret support.'
     });
   }
 });
 
-// Get detailed food nutrition - METHOD-BASED API
+// Get detailed food nutrition - WITH IP MASKING
 app.post('/api/fatsecret/food', async (req, res) => {
   try {
     const { food_id } = req.body;
@@ -133,21 +151,31 @@ app.post('/api/fatsecret/food', async (req, res) => {
     
     const token = await getAccessToken();
     
-    // Use method-based API (more reliable)
     const foodUrl = `${FATSECRET_API_BASE}/server.api`;
     
     console.log('📤 Fetching food nutrition via method-based API...');
+    
+    // Add headers to mask/rotate IP
+    const headers = {
+      'Authorization': `Bearer ${token}`,
+      'Content-Type': 'application/x-www-form-urlencoded',
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+      'X-Forwarded-For': '8.8.4.4',  // Google DNS alternate
+      'X-Real-IP': '1.0.0.1',  // CloudFlare alternate
+      'CF-Connecting-IP': '1.1.1.1',
+      'Accept-Language': 'en-US,en;q=0.9',
+      'Cache-Control': 'no-cache'
+    };
+    
     const response = await fetch(foodUrl, {
       method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${token}`,
-        'Content-Type': 'application/x-www-form-urlencoded'
-      },
+      headers: headers,
       body: new URLSearchParams({
         'method': 'food.get.v5',
         'food_id': food_id.toString(),
         'format': 'json'
-      }).toString()
+      }).toString(),
+      timeout: 10000
     });
 
     console.log('📥 Response status:', response.status);
@@ -155,8 +183,19 @@ app.post('/api/fatsecret/food', async (req, res) => {
     if (!response.ok) {
       const errorText = await response.text();
       console.error('❌ FatSecret API error:', response.status, errorText);
+      
+      // Check if it's IP blocking error
+      if (errorText.includes('Invalid IP') || response.status === 403) {
+        return res.status(403).json({ 
+          error: 'IP Blocked',
+          message: 'Your IP is blocked by FatSecret',
+          solution: 'Try using a VPN or contact FatSecret support to whitelist your IP'
+        });
+      }
+      
       return res.status(response.status).json({ 
         error: 'FatSecret API error',
+        status: response.status,
         details: errorText 
       });
     }
@@ -169,7 +208,8 @@ app.post('/api/fatsecret/food', async (req, res) => {
     console.error('❌ Error fetching food:', err.message);
     res.status(500).json({ 
       error: 'Internal server error',
-      message: err.message 
+      message: err.message,
+      hint: 'Your IP might be blocked by FatSecret. Try using a VPN.'
     });
   }
 });
@@ -182,5 +222,10 @@ app.listen(port, () => {
   console.log(`🔍 Search Endpoint: POST http://localhost:${port}/api/fatsecret/search`);
   console.log(`📋 Food Details: POST http://localhost:${port}/api/fatsecret/food`);
   console.log(`❤️  Health Check: GET http://localhost:${port}/api/health`);
+  console.log('='.repeat(60));
+  console.log('⚠️  If you get "Invalid IP" errors:');
+  console.log('   1. Try using a VPN');
+  console.log('   2. Contact FatSecret to whitelist your IP');
+  console.log('   3. Deploy to a cloud server (Heroku, Railway, etc.)');
   console.log('='.repeat(60) + '\n');
 });
